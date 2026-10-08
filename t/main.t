@@ -23,12 +23,15 @@ the calls that look the same and are not.
 =cut
 
 use Test::More;
+use File::Path ();
+use File::Temp ();
+use PPI        ();
 use Perl::Critic;
+use Perl::Critic::Distribution ();
 
 # Loaded so that a syntax error in it is a compile failure here rather than
-# Perl::Critic reporting no such policy.  Named as a string below, which is
-# what ProhibitUnusedImports cannot see.
-use Perl::Critic::Policy::BuiltinFunctions::ProhibitIndirectBooleanGrep;    ## no critic (ProhibitUnusedImports)
+# Perl::Critic reporting no such policy.
+use Perl::Critic::Policy::BuiltinFunctions::ProhibitIndirectBooleanGrep ();
 
 # -profile => q{} because Perl::Critic otherwise walks up from cwd looking for a
 # .perlcriticrc, finds this dist's own, and runs every policy in it against
@@ -112,5 +115,53 @@ $check_table->(
     'the left of a fat comma' => [ 0, $SUB . q{my %h = ( hits => 1 ); if ( $h{x} ) { 1 }} ],
     'the name of the sub'     => [ 0, $SUB ],
 );
+
+# The package of a call is how a bare name from another file is matched.
+{
+    my $ppi      = PPI::Document->new( \"package A;\nfoo();\npackage B { bar() }\nbaz();\npackage C;\nqux();\n" );
+    my %word     = map { ( $_->content => $_ ) } @{ $ppi->find('PPI::Token::Word') };
+    my $packages = Perl::Critic::Policy::BuiltinFunctions::ProhibitIndirectBooleanGrep::packages_in($ppi);
+    my $at       = sub { return Perl::Critic::Policy::BuiltinFunctions::ProhibitIndirectBooleanGrep::package_at( $word{ $_[0] }, $packages ) };
+
+    is( $at->('foo'), 'A', 'package_at: after a package statement' );
+    is( $at->('bar'), 'B', 'package_at: inside the block of a package' );
+    is( $at->('baz'), 'A', 'package_at: after that block, the statement before it again' );
+    is( $at->('qux'), 'C', 'package_at: after a later statement' );
+}
+
+# A sub in one file of a distribution, and calls of it in another.  Through
+# Perl::Critic::Distribution, which needs files on disk under lib/.
+{
+    local %Perl::Critic::Distribution::FOR;
+    local $ENV{XDG_CACHE_HOME} = File::Temp::tempdir( CLEANUP => 1 );
+
+    my $root = File::Temp::tempdir( CLEANUP => 1 );
+    File::Path::make_path("$root/lib/Some");
+    my %files = (
+        'dist.ini'          => "name = Some\n",
+        'lib/Some.pm'       => "package Some;\nsub hits { return grep { \$_ > 1 } \@_ }\nsub all { return \@_ }\n1;\n",
+        'lib/Some/Same.pm'  => "package Some;\nsub check { return hits(\@_) ? 1 : 0 }\n1;\n",
+        'lib/Some/Other.pm' => "package Some::Other;\nsub one { return Some::hits(\@_) ? 1 : 0 }\nsub two { return hits(\@_) ? 1 : 0 }\nsub three { my (\$x) = Some::hits(\@_); return \$x }\n1;\n",
+        'lib/Some/Lists.pm' => "package Some::Lists;\nsub one { my \@h = Some::hits(\@_); return Some::all(\@_) ? 1 : 0 }\nsub two { return Some->hits(\@_) ? 1 : 0 }\n1;\n",
+    );
+    foreach my $name ( keys %files ) {
+        open( my $fh, '>', "$root/$name" ) or die "$root/$name: $!";
+        print {$fh} $files{$name};
+        close($fh) or die "$root/$name: $!";
+    }
+
+    my $found = sub {
+        my ($file) = @_;
+        return [ map { $_->line_number . q{ } . $_->description } $critic->critique("$root/$file") ];
+    };
+
+    is_deeply( $found->('lib/Some/Same.pm'), ['2 A sub that returns a grep, tested for truth'], 'another file: a bare call in the package of the sub' );
+    is_deeply(
+        $found->('lib/Some/Other.pm'),
+        [ '2 A sub that returns a grep, tested for truth', '4 A sub that returns a grep, for its first element' ],
+        'another file: a qualified call, and not a bare one from another package, whose import is not known'
+    );
+    is_deeply( $found->('lib/Some/Lists.pm'), [], 'another file: a list, a sub that returns a list, and a method' );
+}
 
 done_testing;

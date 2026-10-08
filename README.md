@@ -19,10 +19,10 @@ my sub waiting { return grep { !$out{$_} } @found }
 while ( waiting() ) { ... }    # reported
 ```
 
-This policy reports such a call.  The sub is defined in the same file, and its
-result is a `grep`: the value of a `return`, or its last statement.  The call
-is reported where the caller uses only whether the result is empty, and where
-it uses only the first element, which `first` finds without reading the rest:
+This policy reports such a call.  The result of the sub is a `grep`: the
+value of a `return`, or its last statement.  The call is reported where the
+caller uses only whether the result is empty, and where it uses only the first
+element, which `first` finds without reading the rest:
 
 ```perl
 my ($next) = waiting();        # reported
@@ -31,6 +31,13 @@ my ($next) = waiting();        # reported
 The report is at the call and not at the sub, because the same sub can be
 right for a caller that wants the list.  The fix is usually a second sub, or
 `any` or `first` at the call.
+
+## Where the sub can be
+
+In the same file, by its name.  In another file of the same distribution,
+which [Perl::Critic::Distribution](https://metacpan.org/pod/Perl%3A%3ACritic%3A%3ADistribution) reads: a package sub, called by its full
+name, as `Some::hits()`, or by its bare name from the same package.  A policy
+that reads the distribution through the same library shares its parse.
 
 ## Truth
 
@@ -46,9 +53,9 @@ A call in list context, a count, a comparison, or a call through
 `scalar()`.  A sub that asks `wantarray`, because it chooses its own result
 for scalar context.  A `grep` that reaches the return through a variable, and
 one inside an inner anonymous sub.  A method call, because the method that
-runs can be another sub of the same name.  A sub defined in another file,
-because Perl::Critic gives a policy one file.  A `map`, for which there is no
-`any` to use instead.
+runs can be another sub of the same name.  A bare call of a sub from another
+file in another package, because what it imports is not known.  A `map`, for
+which there is no `any` to use instead.
 
 # CONFIGURATION
 
@@ -66,7 +73,56 @@ This Policy is not configurable except for the standard options.
 
 The whole document, because a call can come before the sub that it calls.
 
+### initialize\_if\_enabled
+
+Registers what this policy needs from each file of a distribution with
+[Perl::Critic::Distribution](https://metacpan.org/pod/Perl%3A%3ACritic%3A%3ADistribution): the package subs whose value is a `grep`.  A
+lexical sub is left out, because no other file can call it.
+
 ### violates
+
+## FUNCTIONS
+
+The steps of `violates`, for its tests.
+
+### grep\_subs\_in
+
+```perl
+my @found = grep_subs_in( $ppi, packages_in($ppi) );
+```
+
+Each sub of a document whose value is a `grep`, as a pair of its statement
+and its full name.  A sub that asks `wantarray` is not one.
+
+### returns\_grep
+
+Whether the value of a block is a `grep`: the value of a `return` anywhere in
+it, or its last statement.  Not a `return` inside an inner sub, which returns
+from that sub.
+
+### packages\_in
+
+The `package` statements of a document, in order, for `package_at`.  A
+document is searched once, and not once for each element.
+
+### package\_at
+
+```perl
+my $package = package_at( $elem, packages_in($ppi) );
+```
+
+The package that an element is in: that of the block of a `package NAME { }`
+around it, or else that of the last `package NAME;` before it, or `main`.
+
+### is\_call
+
+Whether a word is a call of a sub by that name, and not a method, a hash key,
+the left of a fat comma, or the name in a sub statement.
+
+### use\_of
+
+How the caller uses the result of a call: `truth`, `first`, or nothing.
+["Truth"](#truth) says when a call is tested for truth.
 
 # AUTHORS
 

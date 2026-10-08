@@ -7,8 +7,9 @@ use warnings FATAL => 'all';
 use 5.014;
 use re '/aa';
 use Readonly;
-use List::Util          qw{any first};
-use Perl::Critic::Utils qw{ :severities };
+use List::Util                 qw{any first};
+use Perl::Critic::Distribution ();
+use Perl::Critic::Utils        qw{ :severities };
 
 use parent qw{Perl::Critic::Policy};
 
@@ -23,16 +24,23 @@ one call away:
     ...
     while ( waiting() ) { ... }    # reported
 
-This policy reports such a call.  The sub is defined in the same file, and its
-result is a C<grep>: the value of a C<return>, or its last statement.  The call
-is reported where the caller uses only whether the result is empty, and where
-it uses only the first element, which C<first> finds without reading the rest:
+This policy reports such a call.  The result of the sub is a C<grep>: the
+value of a C<return>, or its last statement.  The call is reported where the
+caller uses only whether the result is empty, and where it uses only the first
+element, which C<first> finds without reading the rest:
 
     my ($next) = waiting();        # reported
 
 The report is at the call and not at the sub, because the same sub can be
 right for a caller that wants the list.  The fix is usually a second sub, or
 C<any> or C<first> at the call.
+
+=head2 Where the sub can be
+
+In the same file, by its name.  In another file of the same distribution,
+which L<Perl::Critic::Distribution> reads: a package sub, called by its full
+name, as C<Some::hits()>, or by its bare name from the same package.  A policy
+that reads the distribution through the same library shares its parse.
 
 =head2 Truth
 
@@ -48,9 +56,9 @@ A call in list context, a count, a comparison, or a call through
 C<scalar()>.  A sub that asks C<wantarray>, because it chooses its own result
 for scalar context.  A C<grep> that reaches the return through a variable, and
 one inside an inner anonymous sub.  A method call, because the method that
-runs can be another sub of the same name.  A sub defined in another file,
-because Perl::Critic gives a policy one file.  A C<map>, for which there is no
-C<any> to use instead.
+runs can be another sub of the same name.  A bare call of a sub from another
+file in another package, because what it imports is not known.  A C<map>, for
+which there is no C<any> to use instead.
 
 =head1 CONFIGURATION
 
@@ -67,6 +75,16 @@ Readonly::Hash my %CONDITIONAL => map { $_ => 1 } qw{ if elsif unless while unti
 Readonly::Hash my %NEGATION    => map { $_ => 1 } qw{ ! not };
 Readonly::Hash my %LOGICAL     => map { $_ => 1 } qw{ && || and or };
 
+# Change it when what the collector returns changes shape.
+Readonly::Scalar my $DATA_FORMAT => 1;
+
+# The part of a name after its last ::, which is all of a bare name.
+my $bare_name = sub {
+    my ($name) = @_;
+    my $at     = rindex $name, '::';
+    return $at < 0 ? $name : substr $name, $at + 2;
+};
+
 =head2 METHODS
 
 =head3 supported_parameters
@@ -79,8 +97,6 @@ Readonly::Hash my %LOGICAL     => map { $_ => 1 } qw{ && || and or };
 
 The whole document, because a call can come before the sub that it calls.
 
-=head3 violates
-
 =cut
 
 sub supported_parameters { return () }
@@ -88,19 +104,108 @@ sub default_severity     { return $SEVERITY_LOW }
 sub default_themes       { return qw{ performance } }
 sub applies_to           { return 'PPI::Document' }
 
-# Whether the significant children of a block end in a grep that is its value:
-# a return of one anywhere in the body, or one as the last statement.  Not one
-# inside an inner sub, whose returns are its own.
-my $returns_grep = sub {
+=head3 initialize_if_enabled
+
+Registers what this policy needs from each file of a distribution with
+L<Perl::Critic::Distribution>: the package subs whose value is a C<grep>.  A
+lexical sub is left out, because no other file can call it.
+
+=cut
+
+sub initialize_if_enabled {
+    my ( $self, $config ) = @_;
+
+    Perl::Critic::Distribution->register(
+        name    => __PACKAGE__,
+        version => join( q{/}, $DATA_FORMAT, Perl::Critic::Distribution->stamp(__FILE__) // q{} ),
+        collect => sub {
+            my ($ppi) = @_;
+            return { grep_subs => [ map { $_->[1] } grep { !$_->[0]->type } grep_subs_in( $ppi, packages_in($ppi) ) ] };
+        },
+    );
+    return $self->SUPER::initialize_if_enabled($config);
+}
+
+=head3 violates
+
+=cut
+
+sub violates {
+    my ( $self, undef, $doc ) = @_;
+
+    # The subs of this file by the name that a call here uses, and those of
+    # the rest of the distribution by their full name.
+    my $packages = packages_in($doc);
+    my %local    = map { ( $_->[0]->name => 1 ) } grep_subs_in( $doc, $packages );
+    my %remote;
+    my $filename = $doc->filename;
+    if ( my $dist = defined $filename && Perl::Critic::Distribution->for_file($filename) ) {
+        %remote = map {
+            map { ( $_ => 1 ) }
+              @{ $_->{grep_subs} }
+        } values %{ $dist->collected(__PACKAGE__) };
+    }
+    return if !%local && !%remote;
+
+    # The last part of each full name, so that a word that cannot be one is
+    # passed over before its package is looked for.
+    my %bare = map { ( $bare_name->($_) => 1 ) } keys %remote;
+
+    my @violations;
+    foreach my $word ( @{ $doc->find('PPI::Token::Word') || [] } ) {
+        my $name = $word->content;
+        next if !$local{$name} && !$bare{ $bare_name->($name) };
+        my $full = index( $name, '::' ) >= 0 ? $name : package_at( $word, $packages ) . "::$name";
+        next if !$local{$name} && !$remote{$full};
+        next if !is_call($word);
+
+        my $use = use_of($word) or next;
+        push @violations, $use eq 'first'
+          ? $self->violation( $DESC_FIRST, $EXPL_FIRST, $word )
+          : $self->violation( $DESC_TRUTH, $EXPL_TRUTH, $word );
+    }
+    return @violations;
+}
+
+=head2 FUNCTIONS
+
+The steps of C<violates>, for its tests.
+
+=head3 grep_subs_in
+
+    my @found = grep_subs_in( $ppi, packages_in($ppi) );
+
+Each sub of a document whose value is a C<grep>, as a pair of its statement
+and its full name.  A sub that asks C<wantarray> is not one.
+
+=cut
+
+sub grep_subs_in {
+    my ( $ppi, $packages ) = @_;
+
+    my @found;
+    foreach my $sub ( @{ $ppi->find('PPI::Statement::Sub') || [] } ) {
+        my $block = $sub->block or next;
+        next if $block->find_any( sub { $_[1]->isa('PPI::Token::Word') && $_[1]->content eq 'wantarray' } );
+        next if !returns_grep($block);
+
+        my $name = $sub->name;
+        push @found, [ $sub, index( $name, '::' ) >= 0 ? $name : package_at( $sub, $packages ) . "::$name" ];
+    }
+    return @found;
+}
+
+=head3 returns_grep
+
+Whether the value of a block is a C<grep>: the value of a C<return> anywhere in
+it, or its last statement.  Not a C<return> inside an inner sub, which returns
+from that sub.
+
+=cut
+
+sub returns_grep {
     my ($block) = @_;
 
-    my $inner = sub {
-        my ($elem) = @_;
-        for ( my $up = $elem->parent; $up && $up != $block; $up = $up->parent ) {
-            return 1 if $up->isa('PPI::Statement::Sub') || ( $up->isa('PPI::Structure::Block') && ( $up->sprevious_sibling // q{} ) eq 'sub' );
-        }
-        return 0;
-    };
     my $starts_grep = sub {
         my ( $statement, $skip ) = @_;
         my @parts = $statement->schildren;
@@ -109,28 +214,71 @@ my $returns_grep = sub {
     };
 
     my $returns = $block->find( sub { $_[1]->isa('PPI::Statement::Break') && ( $_[1]->schild(0) // q{} ) eq 'return' } ) || [];
-    return 1 if any { !$inner->($_) && $starts_grep->( $_, 1 ) } @$returns;
+    foreach my $return (@$returns) {
+        next if !$starts_grep->( $return, 1 );
+
+        # One inside an inner sub returns from that sub.
+        my $inner = 0;
+        for ( my $up = $return->parent; $up && $up != $block; $up = $up->parent ) {
+            $inner ||= $up->isa('PPI::Statement::Sub') || ( $up->isa('PPI::Structure::Block') && ( $up->sprevious_sibling // q{} ) eq 'sub' );
+        }
+        return 1 if !$inner;
+    }
 
     my $last = ( grep { $_->isa('PPI::Statement') } $block->schildren )[-1];
     return $last && ref $last eq 'PPI::Statement' && $starts_grep->( $last, 0 );
-};
+}
 
-# The subs of the document whose value is a grep, by name.
-my $grep_subs = sub {
-    my ($doc) = @_;
-    my %found;
-    foreach my $sub ( @{ $doc->find('PPI::Statement::Sub') || [] } ) {
-        my $block = $sub->block or next;
-        next                     if $block->find_any( sub { $_[1]->isa('PPI::Token::Word') && $_[1]->content eq 'wantarray' } );
-        $found{ $sub->name } = 1 if $returns_grep->($block);
+=head3 packages_in
+
+The C<package> statements of a document, in order, for C<package_at>.  A
+document is searched once, and not once for each element.
+
+=cut
+
+sub packages_in {
+    my ($ppi) = @_;
+    return $ppi->find('PPI::Statement::Package') || [];
+}
+
+=head3 package_at
+
+    my $package = package_at( $elem, packages_in($ppi) );
+
+The package that an element is in: that of the block of a C<package NAME { }>
+around it, or else that of the last C<package NAME;> before it, or C<main>.
+
+=cut
+
+sub package_at {
+    my ( $elem, $packages ) = @_;
+
+    my $package = 'main';
+    foreach my $statement (@$packages) {
+        my $block = first { $_->isa('PPI::Structure::Block') } $statement->schildren;
+        if ($block) {
+            for ( my $up = $elem->parent; $up; $up = $up->parent ) {
+                return $statement->namespace if $up == $block;
+            }
+            next;
+        }
+        my ( $line,    $col )    = @{ $statement->location }[ 0, 1 ];
+        my ( $at_line, $at_col ) = @{ $elem->location }[ 0, 1 ];
+        $package = $statement->namespace if $line < $at_line || ( $line == $at_line && $col < $at_col );
     }
-    return \%found;
-};
+    return $package;
+}
 
-# Whether a word is a call of a sub by that name, and not a method, a hash key,
-# the left of a fat comma, or the name in a sub statement.
-my $is_call = sub {
+=head3 is_call
+
+Whether a word is a call of a sub by that name, and not a method, a hash key,
+the left of a fat comma, or the name in a sub statement.
+
+=cut
+
+sub is_call {
     my ($word) = @_;
+
     my $parent = $word->parent;
     return 0 if $parent->isa('PPI::Statement::Sub');
     my $before = $word->sprevious_sibling;
@@ -139,44 +287,22 @@ my $is_call = sub {
     return 0 if $after          && $after->isa('PPI::Token::Operator')               && $after->content eq '=>';
     return 0 if $parent->parent && $parent->parent->isa('PPI::Structure::Subscript') && $parent->schildren == 1;
     return 1;
-};
+}
 
-# The call as an operand: the word, and its argument list when it has one.
-my $operand_end = sub {
+=head3 use_of
+
+How the caller uses the result of a call: C<truth>, C<first>, or nothing.
+L</Truth> says when a call is tested for truth.
+
+=cut
+
+sub use_of {
     my ($word) = @_;
-    my $after = $word->snext_sibling;
-    return $after && $after->isa('PPI::Structure::List') ? $after : $word;
-};
 
-# Whether the siblings of a call, within its own statement, are only the
-# logical operators and negations that test it for truth.
-my $only_logic = sub {
-    my ( $word, $end ) = @_;
-    my $statement = $word->parent;
-    foreach my $part ( $statement->schildren ) {
-        next     if $part == $word || $part == $end;
-        next     if $part->isa('PPI::Token::Operator') && ( $LOGICAL{ $part->content } || $NEGATION{ $part->content } );
-        next     if $part->isa('PPI::Token::Word')     && ( $LOGICAL{ $part->content } || $NEGATION{ $part->content } );
-        next     if $part->isa('PPI::Token::Symbol') || $part->isa('PPI::Structure::List');
-        return 0 if $part->isa('PPI::Token::Operator');
-    }
-    return 1;
-};
+    # The call as an operand: the word, and its argument list when it has one.
+    my $end = $word->snext_sibling;
+    $end = $word if !( $end && $end->isa('PPI::Structure::List') );
 
-# Whether everything between the modifier and the call is logic and operands.
-my $only_logic_after = sub {
-    my ( $parts, $from, $to ) = @_;
-    foreach my $part ( @{$parts}[ $from + 1 .. $to - 1 ] ) {
-        next     if $LOGICAL{ $part->content } || $NEGATION{ $part->content };
-        return 0 if $part->isa('PPI::Token::Operator');
-    }
-    return 1;
-};
-
-# How the caller uses the result: 'truth', 'first', or nothing.
-my $use_of = sub {
-    my ($word)    = @_;
-    my $end       = $operand_end->($word);
     my $before    = $word->sprevious_sibling;
     my $statement = $word->parent;
 
@@ -187,19 +313,32 @@ my $use_of = sub {
     return 'truth' if $before && $NEGATION{ $before->content };
     return 'truth' if $after && $after->content eq '?' && ( !$before || $before->content eq '=' || $before->content eq 'return' );
 
-    # In a condition, alone or among logical operators.
+    # In a condition, alone or among logical operators and their operands.
     my $holder = $statement->parent;
-    return 'truth' if $holder && $holder->isa('PPI::Structure::Condition') && $only_logic->( $word, $end );
+    if ( $holder && $holder->isa('PPI::Structure::Condition') ) {
+        my $only_logic = 1;
+        foreach my $part ( $statement->schildren ) {
+            next            if $part == $word             || $part == $end;
+            next            if $LOGICAL{ $part->content } || $NEGATION{ $part->content };
+            $only_logic = 0 if $part->isa('PPI::Token::Operator');
+        }
+        return 'truth' if $only_logic;
+    }
 
-    # After a postfix modifier, to the end of the statement.  By place among
-    # the parts of the statement, because a statement can wrap.
+    # After a postfix modifier, by place among the parts of the statement,
+    # because a statement can wrap.
     my @parts    = $statement->schildren;
     my ($at)     = grep { $parts[$_] == $word } 0 .. $#parts;
     my $modifier = first { $_ > 0 && $parts[$_]->isa('PPI::Token::Word') && $CONDITIONAL{ $parts[$_]->content } } 0 .. $at - 1;
-    return 'truth' if defined $modifier && ( $before == $parts[$modifier] || ( $LOGICAL{ $before->content } && $only_logic_after->( \@parts, $modifier, $at ) ) );
+    if ( defined $modifier ) {
+        return 'truth' if $before == $parts[$modifier];
+        return 'truth'
+          if $LOGICAL{ $before->content }
+          && !any { $_->isa('PPI::Token::Operator') && !$LOGICAL{ $_->content } && !$NEGATION{ $_->content } } @parts[ $modifier + 1 .. $at - 1 ];
+    }
 
-    # The left of a logical operator that starts the statement, as in a
-    # check followed by or die.
+    # The left of a logical operator that starts the statement, as in a check
+    # followed by or die.
     return 'truth' if !$before && $after && $LOGICAL{ $after->content } && $statement->schild(0) == $word;
 
     # A list of one scalar on the left of the assignment, declared or not.
@@ -211,23 +350,6 @@ my $use_of = sub {
         }
     }
     return;
-};
-
-sub violates {
-    my ( $self, undef, $doc ) = @_;
-
-    my $subs = $grep_subs->($doc);
-    return if !%$subs;
-
-    my @violations;
-    foreach my $word ( @{ $doc->find('PPI::Token::Word') || [] } ) {
-        next if !$subs->{ $word->content } || !$is_call->($word);
-        my $use = $use_of->($word) or next;
-        push @violations, $use eq 'first'
-          ? $self->violation( $DESC_FIRST, $EXPL_FIRST, $word )
-          : $self->violation( $DESC_TRUTH, $EXPL_TRUTH, $word );
-    }
-    return @violations;
 }
 
 1;
