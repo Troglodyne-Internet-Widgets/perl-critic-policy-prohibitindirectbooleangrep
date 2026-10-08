@@ -41,10 +41,13 @@ if you raise or lower the floor, change the profile as well as the `use` lines.
 
 | | |
 |---|---|
-| `perldoc Perl::Critic::Policy::BuiltinFunctions::ProhibitIndirectBooleanGrep` | what this is for and how a caller uses it |
+| `perldoc Perl::Critic::Policy::BuiltinFunctions::ProhibitIndirectBooleanGrep` | what this reports, and what it leaves alone |
 | `.perlcriticrc` | the policies, which are the house style made enforceable |
 | `Changes` | what changed and when, per release |
 | `dist.ini` | the build, and what has to be installed to run it |
+
+It reads the other files of a distribution through Perl::Critic::Distribution,
+which is beside this one in `~/Code`.
 
 ## Finishing a changeset
 
@@ -63,7 +66,9 @@ Then run `podchecker` on each changed file.  Run `perl -Ilib -c` on each
 changed script that no test loads, because the tests do not compile it.
 
 The pre-commit hook does the rest.  It tidies the Perl that you staged, runs
-perlcritic on it, and runs the tests.  If a step fails, the hook stops the
+perlcritic on it, and runs the tests that the commit can break, which
+`tests-covering` chooses.  The post-commit hook keeps the records of
+`tests-covering` up to date, in the background.  If a step fails, the hook stops the
 commit and prints the reason.  Do not run `perltidy` or `perlcritic` yourself,
 and do not run the tests to decide whether a change is ready to commit.
 
@@ -76,12 +81,18 @@ prove -lv t/<file>.t
 
 Do the same to see a new test fail before you fix what it tests.
 
-In each clone that you commit from, install the hook once.  Git does not
-install it for you, and without the hook the tree drifts from its style:
+In each clone that you commit from, install both hooks once.  Git does not
+install them for you, and without the hooks the tree drifts from its style:
 
 ```
-cp git-hooks/pre-commit .git/hooks/
+cp git-hooks/pre-commit git-hooks/post-commit .git/hooks/
 ```
+
+A file that no test loads, such as a fixture, gets its tests from
+`.tests-covering-map.pl`.  A path that the map cannot place runs every test.
+If a commit runs every test but does not touch everything, the map probably
+needs a rule.  Add the rule in the same change, and name the tests that read
+the file.
 
 ## When something is slow
 
