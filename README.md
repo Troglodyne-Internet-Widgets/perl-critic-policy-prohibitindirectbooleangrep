@@ -124,6 +124,15 @@ the left of a fat comma, or the name in a sub statement.
 How the caller uses the result of a call: `truth`, `first`, or nothing.
 ["Truth"](#truth) says when a call is tested for truth.
 
+# BUGS
+
+Please report any bugs or feature requests on the bugtracker website
+[https://github.com/teodesian/perl-critic-policy-prohibitindirectbooleangrep/issues](https://github.com/teodesian/perl-critic-policy-prohibitindirectbooleangrep/issues)
+
+When submitting a bug or request, please include a test-file or a
+patch to an existing test-file that illustrates the bug or desired
+feature.
+
 # AUTHORS
 
 Current Maintainers:
