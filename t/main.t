@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!perl
 use strict;
 use warnings FATAL => 'all';
 
@@ -118,8 +118,11 @@ $check_table->(
 
 # The package of a call is how a bare name from another file is matched.
 {
-    my $ppi      = PPI::Document->new( \"package A;\nfoo();\npackage B { bar() }\nbaz();\npackage C;\nqux();\n" );
-    my %word     = map { ( $_->content => $_ ) } @{ $ppi->find('PPI::Token::Word') };
+    my $ppi = PPI::Document->new( \"package A;\nfoo();\npackage B { bar() }\nbaz();\npackage C;\nqux();\n" );
+    my %word;
+    foreach my $token ( @{ $ppi->find('PPI::Token::Word') } ) {
+        $word{ $token->content } = $token;
+    }
     my $packages = Perl::Critic::Policy::BuiltinFunctions::ProhibitIndirectBooleanGrep::packages_in($ppi);
     my $at       = sub { return Perl::Critic::Policy::BuiltinFunctions::ProhibitIndirectBooleanGrep::package_at( $word{ $_[0] }, $packages ) };
 
@@ -152,7 +155,11 @@ $check_table->(
 
     my $found = sub {
         my ($file) = @_;
-        return [ map { $_->line_number . q{ } . $_->description } $critic->critique("$root/$file") ];
+        my @reports;
+        foreach my $violation ( $critic->critique("$root/$file") ) {
+            push @reports, $violation->line_number . q{ } . $violation->description;
+        }
+        return \@reports;
     };
 
     is_deeply( $found->('lib/Some/Same.pm'), ['2 A sub that returns a grep, tested for truth'], 'another file: a bare call in the package of the sub' );
