@@ -7,7 +7,7 @@ use warnings FATAL => 'all';
 use 5.014;
 use re '/aa';
 use Readonly;
-use List::Util                 qw{any first};
+use List::Util                 qw{first};
 use Perl::Critic::Distribution ();
 use Perl::Critic::Utils        qw{ :severities };
 
@@ -120,7 +120,11 @@ sub initialize_if_enabled {
         version => join( q{/}, $DATA_FORMAT, Perl::Critic::Distribution->stamp(__FILE__) // q{} ),
         collect => sub {
             my ($ppi) = @_;
-            return { grep_subs => [ map { $_->[1] } grep { !$_->[0]->type } grep_subs_in( $ppi, packages_in($ppi) ) ] };
+            my @names;
+            foreach my $sub ( grep_subs_in( $ppi, packages_in($ppi) ) ) {
+                push @names, $sub->[1] if !$sub->[0]->type;
+            }
+            return { grep_subs => \@names };
         },
     );
     return $self->SUPER::initialize_if_enabled($config);
@@ -136,7 +140,10 @@ sub violates {
     # The subs of this file by the name that a call here uses, and those of
     # the rest of the distribution by their full name.
     my $packages = packages_in($doc);
-    my %local    = map { ( $_->[0]->name => 1 ) } grep_subs_in( $doc, $packages );
+    my %local;
+    foreach my $sub ( grep_subs_in( $doc, $packages ) ) {
+        $local{ $sub->[0]->name } = 1;
+    }
     my %remote;
     my $filename = $doc->filename;
     if ( my $dist = defined $filename && Perl::Critic::Distribution->for_file($filename) ) {
@@ -149,7 +156,10 @@ sub violates {
 
     # The last part of each full name, so that a word that cannot be one is
     # passed over before its package is looked for.
-    my %bare = map { ( $bare_name->($_) => 1 ) } keys %remote;
+    my %bare;
+    foreach my $full_name ( keys %remote ) {
+        $bare{ $bare_name->($full_name) } = 1;
+    }
 
     my @violations;
     foreach my $word ( @{ $doc->find('PPI::Token::Word') || [] } ) {
@@ -289,6 +299,32 @@ sub is_call {
     return 1;
 }
 
+=head3 tested_by_modifier
+
+Whether the call, at index C<$at> of the parts of its statement, is the
+condition of a postfix modifier, or on the left of logical operators that make
+up the condition.  C<$before> is the part just before the call.
+
+=cut
+
+sub tested_by_modifier {
+    my ( $parts, $at, $before ) = @_;
+
+    my $modifier;
+    foreach my $index ( 1 .. $at - 1 ) {
+        next if !$parts->[$index]->isa('PPI::Token::Word') || !$CONDITIONAL{ $parts->[$index]->content };
+        $modifier = $index;
+        last;
+    }
+    return 0 if !defined $modifier;
+    return 1 if $before == $parts->[$modifier];
+    return 0 if !$LOGICAL{ $before->content };
+    foreach my $part ( @{$parts}[ $modifier + 1 .. $at - 1 ] ) {
+        return 0 if $part->isa('PPI::Token::Operator') && !$LOGICAL{ $part->content } && !$NEGATION{ $part->content };
+    }
+    return 1;
+}
+
 =head3 use_of
 
 How the caller uses the result of a call: C<truth>, C<first>, or nothing.
@@ -327,15 +363,9 @@ sub use_of {
 
     # After a postfix modifier, by place among the parts of the statement,
     # because a statement can wrap.
-    my @parts    = $statement->schildren;
-    my ($at)     = grep { $parts[$_] == $word } 0 .. $#parts;
-    my $modifier = first { $_ > 0 && $parts[$_]->isa('PPI::Token::Word') && $CONDITIONAL{ $parts[$_]->content } } 0 .. $at - 1;
-    if ( defined $modifier ) {
-        return 'truth' if $before == $parts[$modifier];
-        return 'truth'
-          if $LOGICAL{ $before->content }
-          && !any { $_->isa('PPI::Token::Operator') && !$LOGICAL{ $_->content } && !$NEGATION{ $_->content } } @parts[ $modifier + 1 .. $at - 1 ];
-    }
+    my @parts = $statement->schildren;
+    my ($at) = grep { $parts[$_] == $word } 0 .. $#parts;
+    return 'truth' if tested_by_modifier( \@parts, $at, $before );
 
     # The left of a logical operator that starts the statement, as in a check
     # followed by or die.
